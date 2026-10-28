@@ -72,18 +72,55 @@
         _vt_b_reconciliation: []
 
     - name: "check_vlan_trunk_reconciliation | Extract each NAD's vlanID/physicalNetworkName/owner"
+      # NOTE: a cluster's default OVN-Kubernetes pod-network NAD (e.g.
+      # {"cniVersion":"0.4.0","name":"ovn-kubernetes","type":"ovn-k8s-cni-
+      # overlay"}, no owner/CUDN at all) is ALWAYS present alongside any
+      # UDN/CUDN-managed NADs - confirmed against a real cluster. Its
+      # metadata.labels/ownerReferences come back as explicit JSON null
+      # (present-but-null), not simply absent - `| default([])` does NOT
+      # substitute for an explicit None, only for Undefined, so
+      # `None | map(...)` and `'x' in None` both throw a hard error.
+      # Reproduced exactly: this crashed the WHOLE loop's accumulator
+      # (not just this one item), leaving _vt_b_nad_info completely
+      # undefined for every CUDN downstream - the real cause of a past
+      # "nad_count: 0, all CUDNs ORPHAN" false result on a real client
+      # cluster. Fixed with `default(X, true)` - the boolean second arg
+      # makes the filter substitute on ANY falsy value (None included),
+      # not just on Undefined. Deliberately NOT filtering out non-CUDN
+      # NADs here (e.g. by ownerReferences length) - the reverse-orphan
+      # check below needs the full unfiltered list, including unowned
+      # ones, to detect a UDN-labeled NAD that lost its owning CUDN.
+      #
+      # SECOND bug found while verifying the first fix: the default
+      # OVN-K NAD's spec.config has no vlanID/physicalNetworkName keys
+      # at all, so _config.vlanID is real Jinja Undefined (not None) -
+      # letting an Undefined value sit inside one dict of the
+      # accumulated list silently degrades the WHOLE _vt_b_nad_info
+      # list from a native list-of-dicts to a single stringified repr
+      # (confirmed: `| type_debug` showed "str", and `unique(attribute=
+      # 'ref')` then fails with "'str object' has no attribute 'ref'").
+      # Fixed by explicitly defaulting vlanID/physicalNetworkName to
+      # none before they ever reach the dict literal, so the
+      # expression never touches a bare Undefined value.
       vars:
         _config: "{{ item.spec.config | default('{}') | from_json }}"
+        _owner_refs: "{{ item.metadata.ownerReferences | default([], true) }}"
+        _vlan_id: "{{ _config.vlanID | default(none, true) }}"
+        _phys_net_name: "{{ _config.physicalNetworkName | default(none, true) }}"
       ansible.builtin.set_fact:
-        _vt_b_nad_info: "{{ (_vt_b_nad_info | default([])) + [{'ref': item.metadata.namespace ~ '/' ~ item.metadata.name, 'ns': item.metadata.namespace, 'name': item.metadata.name, 'vlan': _config.vlanID, 'phys': _config.physicalNetworkName, 'owner': (item.metadata.ownerReferences | default([]) | map(attribute='name') | first | default('')), 'owner_kind': (item.metadata.ownerReferences | default([]) | map(attribute='kind') | first | default('')), 'udn_labeled': ('k8s.ovn.org/user-defined-network' in (item.metadata.labels | default({})))}] }}"
+        _vt_b_nad_info: "{{ (_vt_b_nad_info | default([])) + [{'ref': item.metadata.namespace ~ '/' ~ item.metadata.name, 'ns': item.metadata.namespace, 'name': item.metadata.name, 'vlan': _vlan_id, 'phys': _phys_net_name, 'owner': (_owner_refs | map(attribute='name') | first | default('')), 'owner_kind': (_owner_refs | map(attribute='kind') | first | default('')), 'udn_labeled': ('k8s.ovn.org/user-defined-network' in (item.metadata.labels | default({}, true)))}] }}"
       loop: "{{ _vt_b_nads.resources | default([]) }}"
       loop_control:
         label: "{{ item.metadata.name }}"
       ignore_errors: true
 
     - name: "check_vlan_trunk_reconciliation | Flag duplicate VLAN IDs within the same physicalNetworkName"
+      # NOTE: item.vlan/item.phys render as '' (empty string), never
+      # real None, for a NAD with no vlanID/physicalNetworkName (e.g.
+      # the cluster's default OVN-K NAD) - see the extraction task's
+      # comment above. `is not none` is always true for a string, so
+      # check against '' explicitly, not `is none`/`is not none`.
       vars:
-        _key: "{{ item.phys }}/{{ item.vlan }}"
         _matches: "{{ (_vt_b_nad_info | default([])) | selectattr('phys', 'equalto', item.phys) | selectattr('vlan', 'equalto', item.vlan) | map(attribute='ref') | list }}"
       ansible.builtin.set_fact:
         _vt_b_problems: "{{ _vt_b_problems + ['physicalNetworkName ' ~ item.phys ~ ', VLAN ' ~ item.vlan ~ ' used by: ' ~ (_matches | join(', '))] }}"
@@ -92,7 +129,7 @@
         label: "{{ item.ref }}"
         index_var: _idx
       when: >-
-        (item.vlan is not none) and (item.phys is not none)
+        (item.vlan != '') and (item.phys != '')
         and (_matches | length > 1)
         and (_matches | first) == item.ref
 
